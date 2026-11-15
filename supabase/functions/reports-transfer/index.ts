@@ -190,6 +190,167 @@ function report(table: string, spec: Spec, rows: Row[], asOf: string): Row {
     note: table === 'works' ? 'O total representa orçamento de obras, não despesas realizadas.' : table === 'rentals' ? 'O total representa valores de contratos, não receita recebida. Consulte rental_payments para parcelas.' : table === 'bills' || table === 'budget_entries' ? 'Totais brutos separados pelo tipo original do cadastro; não representam saldo líquido.' : null,
   };
 }
+const REPORT_MODULES = ['financial', 'rentals', 'works', 'agenda', 'whatsapp'] as const;
+type ReportModule = typeof REPORT_MODULES[number];
+
+function monthlyReport(table: string, spec: Spec, rows: Row[], asOf: string): Row[] {
+  const months = new Map<string, Row[]>();
+  for (const row of rows) {
+    const month = String(row[spec.date]).slice(0, 7);
+    const items = months.get(month) ?? [];
+    items.push(row);
+    months.set(month, items);
+  }
+  return [...months.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([month, items]) => ({
+    month, ...report(table, spec, items, asOf),
+  }));
+}
+function reportSection(table: string, rows: Row[], asOf: string): Row {
+  const spec = SPECS[table];
+  return {
+    date_field: spec.date,
+    summary: report(table, spec, rows, asOf),
+    monthly: monthlyReport(table, spec, rows, asOf),
+  };
+}
+function indexRows(rows: Row[], field: string): Map<string, Row[]> {
+  const result = new Map<string, Row[]>();
+  for (const row of rows) {
+    const key = String(row[field]);
+    const items = result.get(key) ?? [];
+    items.push(row);
+    result.set(key, items);
+  }
+  return result;
+}
+function overlaps(row: Row, range: ReturnType<typeof period>): boolean {
+  return (!range.to || String(row.start_date) <= range.to)
+    && (!range.from || !row.end_date || String(row.end_date) >= range.from);
+}
+async function systemReport(s: Session, body: Row): Promise<Row> {
+  const range = period(body);
+  const asOf = body.as_of === undefined ? new Date().toISOString().slice(0, 10) : day(body.as_of);
+  const requested = body.modules === undefined ? [...REPORT_MODULES] : body.modules;
+  if (!Array.isArray(requested) || !requested.length || requested.some((item) => typeof item !== 'string' || !REPORT_MODULES.includes(item as ReportModule))) {
+    throw new Problem(400, 'Escolha módulos: financial, rentals, works, agenda ou whatsapp.');
+  }
+  const selected = [...new Set(requested)] as ReportModule[];
+  const modules: Row = {};
+  const warnings: string[] = [
+    'Cada módulo é apurado separadamente. Não some contas, lançamentos e parcelas: podem representar o mesmo fato financeiro.',
+    'A data de referência classifica pagamentos, mas não reconstrói alterações históricas dos cadastros.',
+    'As leituras não constituem um snapshot transacional. Evite editar os dados durante a conferência.',
+  ];
+  const read = (table: string, filter = range) => readRows(s, table, SPECS[table], filter);
+  for (const module of selected) {
+    if (module === 'financial') {
+      const [bills, entries] = await Promise.all([read('bills'), read('budget_entries')]);
+      modules.financial = {
+        bills: reportSection('bills', bills, asOf),
+        budget_entries: reportSection('budget_entries', entries, asOf),
+        note: 'Contas filtradas pelo vencimento; lançamentos pela data da transação. Valores agrupados pelos tipos originais, sem presumir receita, despesa ou saldo líquido.',
+      };
+    }
+    if (module === 'rentals') {
+      // Cadastros anteriores ao período também podem ter parcelas vencendo nele.
+      const [properties, contracts, payments] = await Promise.all([
+        read('properties', {}), read('rentals', {}), read('rental_payments'),
+      ]);
+      const propertyIds = new Set(properties.map((row) => row.id));
+      const ownedContracts = contracts.filter((row) => propertyIds.has(row.property_id));
+      const contractIds = new Set(ownedContracts.map((row) => row.id));
+      const ownedPayments = payments.filter((row) => contractIds.has(row.rental_id));
+      const excludedContracts = contracts.length - ownedContracts.length;
+      const excludedPayments = payments.length - ownedPayments.length;
+      if (excludedContracts || excludedPayments) warnings.push('Aluguéis: vínculos sem imóvel ou contrato acessível à sua conta foram excluídos e contabilizados em excluded_links.');
+      const contractsByProperty = indexRows(ownedContracts, 'property_id');
+      const paymentsByRental = indexRows(ownedPayments, 'rental_id');
+      const overlapping = ownedContracts.filter((row) => overlaps(row, range));
+      modules.rentals = {
+        properties_count: properties.length,
+        contracts_overlapping_period: report('rentals', SPECS.rentals, overlapping, asOf),
+        payments: reportSection('rental_payments', ownedPayments, asOf),
+        excluded_links: { contracts: excludedContracts, payments: excludedPayments },
+        by_property: properties.map((property) => {
+          const linked = contractsByProperty.get(String(property.id)) ?? [];
+          const relevant = linked.filter((row) => overlaps(row, range) || paymentsByRental.has(String(row.id)));
+          const propertyPayments = linked.flatMap((row) => paymentsByRental.get(String(row.id)) ?? []);
+          return {
+            property_id: property.id, name: property.name,
+            contracts_overlapping_period: linked.filter((row) => overlaps(row, range)).length,
+            payments: report('rental_payments', SPECS.rental_payments, propertyPayments, asOf),
+            contracts: relevant.map((contract) => ({
+              rental_id: contract.id, tenant: contract.tenant, kind: contract.kind,
+              amount: contract.amount, start_date: contract.start_date, end_date: contract.end_date,
+              due_day: contract.due_day, paid: contract.paid,
+              payments: report('rental_payments', SPECS.rental_payments, paymentsByRental.get(String(contract.id)) ?? [], asOf),
+            })),
+          };
+        }),
+        note: 'Inclui todos os imóveis acessíveis, contratos que se sobrepõem ao período e parcelas com vencimento no período. Tipos mensais ou de temporada são preservados como cadastrados. O campo paid do contrato não substitui a apuração de suas parcelas.',
+      };
+    }
+    if (module === 'works') {
+      const [works, costs] = await Promise.all([read('works', {}), read('work_costs')]);
+      const workIds = new Set(works.map((row) => row.id));
+      const ownedCosts = costs.filter((row) => workIds.has(row.work_id));
+      const costsByWork = indexRows(ownedCosts, 'work_id');
+      if (costs.length !== ownedCosts.length) warnings.push('Obras: custos sem obra acessível à sua conta foram excluídos e contabilizados em excluded_costs.');
+      modules.works = {
+        registered_works: report('works', SPECS.works, works, asOf),
+        costs: reportSection('work_costs', ownedCosts, asOf),
+        excluded_costs: costs.length - ownedCosts.length,
+        by_work: works.map((work) => ({
+          work_id: work.id, name: work.name, client: work.client, status: work.status, budget: work.budget,
+          costs_in_period: report('work_costs', SPECS.work_costs, costsByWork.get(String(work.id)) ?? [], asOf),
+        })),
+        note: 'Inclui todas as obras acessíveis, mesmo cadastradas antes do período. Custos são filtrados por cost_date. O orçamento é o valor atual da obra; custos de um período não representam necessariamente seu custo acumulado.',
+      };
+    }
+    if (module === 'agenda') {
+      const [appointments, reminders] = await Promise.all([read('appointments'), read('reminders')]);
+      const endOfDay = `${asOf}T23:59:59.999Z`;
+      const endTime = Date.parse(endOfDay);
+      modules.agenda = {
+        appointments: {
+          ...reportSection('appointments', appointments, asOf),
+          started_by_reference_date: appointments.filter((row) => Date.parse(String(row.start_at)) <= endTime).length,
+          starting_after_reference_date: appointments.filter((row) => Date.parse(String(row.start_at)) > endTime).length,
+        },
+        reminders: {
+          ...reportSection('reminders', reminders, asOf),
+          sent_by_reference_date: reminders.filter((row) => row.sent_at && Date.parse(String(row.sent_at)) <= endTime).length,
+          scheduled_without_send_by_reference_date: reminders.filter((row) => Date.parse(String(row.scheduled_at)) <= endTime && (!row.sent_at || Date.parse(String(row.sent_at)) > endTime)).length,
+        },
+        note: 'Compromissos são filtrados por start_at; lembretes por scheduled_at. Indicadores usam o fim de as_of em UTC. Início passado não comprova realização do compromisso; ausência de sent_at não comprova falha de entrega. Status e canais são exibidos como cadastrados.',
+      };
+    }
+    if (module === 'whatsapp') {
+      // Não consultar números de telefone nem expor identificadores dos vínculos.
+      const spec: Spec = {
+        fields: { connection_status: text(true, 100), verified_at: { type: 'timestamp' } },
+        date: 'created_at', groups: ['connection_status'], importable: false,
+      };
+      const connections = await readRows(s, 'whatsapp_connections', spec, range);
+      const endTime = Date.parse(`${asOf}T23:59:59.999Z`);
+      modules.whatsapp = {
+        date_field: 'created_at',
+        summary: report('whatsapp_connections', spec, connections, asOf),
+        monthly: monthlyReport('whatsapp_connections', spec, connections, asOf),
+        with_verification_by_reference_date: connections.filter((row) => row.verified_at && Date.parse(String(row.verified_at)) <= endTime).length,
+        without_verification_date: connections.filter((row) => !row.verified_at).length,
+        note: 'Vínculos criados no período, agrupados pelo status atual, sem divulgar telefones. Data de verificação não garante conexão ativa. Não há histórico de mensagens no banco informado.',
+      };
+    }
+  }
+  return {
+    generated_at: new Date().toISOString(), timezone: 'UTC',
+    from: range.from ?? null, to: range.to ?? null, as_of: asOf,
+    modules, warnings,
+    limits: { max_rows_per_source: MAX_ROWS, partial_results: false },
+  };
+}
+
 function dangerousCell(value: string): boolean { return /^[\s]*[=+\-@]/.test(value) || /^[\t\r\n]/.test(value); }
 function csv(rows: Row[], fields: string[], separator: string): string {
   const cell = (value: unknown) => {
@@ -363,8 +524,10 @@ Deno.serve(async (request: Request) => {
   try {
     const s = await session(request);
     const body = await readBody(request);
+    if (body.action === 'system_report') return reply(200, await systemReport(s, body));
     if (body.action === 'options') return reply(200, {
       tables: Object.entries(SPECS).map(([table, spec]) => ({ table, importable: spec.importable, fields: spec.fields, date_field: spec.date, group_fields: spec.groups, monetary_field: spec.money ?? null, references: spec.refs ?? {} })),
+      report_modules: REPORT_MODULES, consolidated_report_action: 'system_report',
       formats: ['csv', 'json'], max_import_rows: MAX_IMPORT, max_result_rows: MAX_ROWS, default_separator: ';', timezone: 'UTC',
     });
     const table = typeof body.table === 'string' ? body.table : '';
@@ -406,7 +569,7 @@ Deno.serve(async (request: Request) => {
       const inserted = await database(s, table, { on_conflict: 'id', select: 'id' }, records);
       return reply(200, { saved: true, table, import_id: batchId, submitted: records.length, inserted: inserted.length, already_present: records.length - inserted.length, record_ids: records.map((row) => row.id) });
     }
-    throw new Problem(400, 'Use options, template, report, export, preview_import ou confirm_import.');
+    throw new Problem(400, 'Use options, template, report, system_report, export, preview_import ou confirm_import.');
   } catch (error) {
     if (error instanceof Problem) return reply(error.status, { error: error.message });
     return reply(502, { error: 'Não foi possível concluir a solicitação. Se estava importando, consulte os registros ou repita exatamente o mesmo lote e import_id.' });

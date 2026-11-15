@@ -12,7 +12,7 @@ A interface deve utilizar a sessão do cliente Supabase existente. Este módulo 
 
 ### Opções e modelos
 
-`{"action":"options"}` retorna tabelas, campos obrigatórios, tipos, referências, agrupamentos, campos de data e limites. Contas, orçamento, compromissos, imóveis, contratos, parcelas de aluguel, obras e custos permitem importação. Lembretes permitem somente relatório e exportação. Conexões de WhatsApp não são expostas por este módulo.
+`{"action":"options"}` retorna tabelas, campos obrigatórios, tipos, referências, agrupamentos, campos de data e limites. Contas, orçamento, compromissos, imóveis, contratos, parcelas de aluguel, obras e custos permitem importação. Lembretes permitem somente relatório e exportação. Conexões de WhatsApp possuem apenas indicadores agregados em system_report; não permitem importação nem exportação de registros neste módulo.
 
 `{"action":"template","table":"bills","separator":";"}` baixa um modelo CSV com cabeçalhos. Separadores aceitos: ponto e vírgula (padrão) ou vírgula.
 
@@ -43,6 +43,38 @@ Os relatórios retornam quantidade, totais monetários quando aplicável e grupo
 Não se presume quais valores de kind significam receita ou despesa. Por isso, os totais são brutos, não saldo líquido. Não se somam contratos, parcelas, contas e orçamento entre si, evitando dupla contagem. Valores de contratos não são receita recebida.
 
 Contas e parcelas incluem um resumo de pagamentos: pagos quando paid_at é anterior ou igual a as_of; abertos nos demais casos; vencidos quando também due_date é anterior a as_of. Vencidos são parte dos abertos. as_of é opcional e usa a data UTC atual por padrão. A classificação usa paid_at e não interpreta valores arbitrários de payment_status; o status original permanece nos agrupamentos. A data de referência não reconstrói versões históricas dos registros.
+
+### Relatório consolidado por funcionalidade
+
+A operação system_report consulta o banco com a sessão autenticada e não grava registros. Não exige table. Exemplo:
+
+```json
+{
+  "action": "system_report",
+  "from": "2026-01-01",
+  "to": "2026-12-31",
+  "as_of": "2026-12-31",
+  "modules": ["financial", "rentals", "works", "agenda", "whatsapp"]
+}
+```
+
+Omitir modules inclui todos os módulos. Uma lista vazia ou módulo desconhecido é recusado. from e to são opcionais e inclusivos. as_of é opcional, usa a data UTC atual e classifica pagamentos e eventos até o fim da data indicada; não limita os registros selecionados nem reconstrói o estado histórico do cadastro.
+
+A resposta contém generated_at, timezone, from, to, as_of, modules, warnings e limits. Os nomes dos módulos também estão disponíveis em options.report_modules.
+
+- financial: contas por vencimento e lançamentos por data da transação, com quantidade, totais brutos, agrupamentos por tipo e categoria e evolução mensal. Contas incluem valores e quantidades pagos, abertos e vencidos segundo paid_at.
+- rentals: todos os imóveis acessíveis, contratos sobrepostos ao período e parcelas vencendo no período. by_property identifica cada imóvel pelo nome, detalha seus contratos e resume pagamentos por imóvel e contrato. Contratos com parcelas no período aparecem mesmo se o contrato não se sobrepuser ao período. Os tipos de aluguel são preservados sem presumir os valores usados para mensal ou temporada. A evolução mensal considera o vencimento das parcelas.
+- works: todas as obras acessíveis, seus orçamentos atuais e status, custos por categoria e evolução mensal por cost_date. by_work relaciona nome, cliente, orçamento e custos no período. Não calcula saldo disponível com custos parciais.
+- agenda: compromissos por start_at e local; lembretes por scheduled_at, canal e status de entrega. Inclui evolução mensal e contagens por data de referência. Compromissos passados não são tratados como realizados. Lembretes sem envio registrado não são classificados automaticamente como falhas.
+- whatsapp: quantidade de vínculos criados no período, grupos por status atual, evolução mensal dos cadastros e contagem com data de verificação até as_of. Não consulta nem retorna telefones. Verificação não é sinônimo de conexão ativa.
+
+As séries monthly incluem apenas meses com registros, em ordem cronológica. Períodos vazios retornam contagens e totais zero, quando aplicáveis, e séries vazias. Totais de diferentes funcionalidades não devem ser somados, pois podem representar o mesmo fato financeiro. A apuração de pagamentos conserva a regra paid_at dos relatórios individuais; payment_status permanece disponível nos agrupamentos.
+
+Os vínculos de parcelas, contratos, imóveis, custos e obras são conferidos com os cadastros acessíveis à conta. Registros sem vínculo acessível são excluídos dos relatórios relacionais, com contadores excluded_links ou excluded_costs e aviso explícito; os relatórios individuais continuam mostrando os registros próprios conforme suas regras anteriores.
+
+Cada leitura permite até 10.000 registros, sem truncamento silencioso. Cadastros de imóveis, contratos e obras são lidos sem filtro de criação para não perder vínculos antigos. Se esses cadastros excederem o limite, reduzir o período não basta: consulte os relatórios individuais com filtros de data ou selecione outros módulos. Uma falha impede a entrega do consolidado inteiro, sem totais parciais. As consultas não são um snapshot transacional.
+
+Não há tabelas de histórico de processamento de documentos ou mensagens na estrutura informada. O relatório não estima extrações, mensagens enviadas ou confirmações de leitura. Esta entrega amplia a função de servidor; não cria uma tela nem altera a autenticação existente.
 
 ### Exportação
 
